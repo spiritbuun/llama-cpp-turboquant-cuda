@@ -104,6 +104,7 @@ public:
 };
 
 
+#if CUDART_VERSION >= 12080
 template <>
 class F8Conversion<Float8E8M0> {
 public:
@@ -123,3 +124,4 @@ public:
     return *reinterpret_cast<float4 *>(&res);
   };
 };
+#endif
