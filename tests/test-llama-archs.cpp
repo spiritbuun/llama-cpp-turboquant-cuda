@@ -4009,7 +4009,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
+                        if (!(nmse_val <= 1e-4)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
