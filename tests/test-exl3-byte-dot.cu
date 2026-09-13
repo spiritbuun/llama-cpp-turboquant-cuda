@@ -1,11 +1,15 @@
 #define EXL3_STANDALONE
+#if defined(GGML_USE_HIP)
+#include "common.cuh"
+#else
 #include <cuda_runtime.h>
+#endif
 #include "exl3-gemv-int8.cuh"
 
 #include <cstdio>
 #include <vector>
 
-// Compile for SM60 to exercise the scalar fallbacks, and SM61+ for DP4A.
+// Compile for SM60 to exercise scalar fallbacks, SM61+ for DP4A, or RDNA for dot4.
 // Enumerate every mul1 codebook product, including unsigned bytes >= 128.
 static __global__ void byte_dots(uint32_t * out) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;

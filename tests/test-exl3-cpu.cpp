@@ -2,6 +2,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "test-exl3-gpu-common.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <vector>
 
 static ggml_backend_t cache_gpu = nullptr;
+static bool gpu_executor = false;
 static decltype(ggml_moe_cache.dispatch) real_dispatch;
 static decltype(ggml_moe_cache.collect) real_collect;
 static int cache_hits = 0;
@@ -76,7 +78,8 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     const int topk = grouped ? 3 : 1;
     auto * ctx = ggml_init({4*1024*1024, nullptr, true});
     auto * w = ggml_new_tensor_3d(ctx, ggml_exl3_type(bits, cb), k, n, experts);
-    auto * backing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k+16, lanes, tokens);
+    const int input_stride = k + (gpu_executor && !grouped ? 0 : 16);
+    auto * backing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, input_stride, lanes, tokens);
     auto * x = ggml_view_3d(ctx, backing, k, lanes, tokens, backing->nb[1], backing->nb[2], 0);
     auto * suh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, experts);
     auto * svh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, experts);
@@ -97,34 +100,30 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, y);
     if (!ggml_backend_supports_op(backend, y)) {
-        printf("CPU_EXL3_UNSUPPORTED bits=%d cb=%d grouped=%d\n", bits, cb, grouped);
+        printf("EXL3_UNSUPPORTED backend=%s bits=%d cb=%d grouped=%d\n", ggml_backend_name(backend), bits, cb, grouped);
         ggml_free(ctx);
         return false;
     }
-    // HIP's cache bridge is available, but its standalone EXL3 executor is
-    // not. The scheduler must leave both dense and routed nodes on CPU.
-    if (cache_gpu && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(
-            ggml_backend_get_device(cache_gpu))), "ROCm") == 0) {
-        GGML_ASSERT(!ggml_backend_supports_op(cache_gpu, y));
-    }
     // Capability probes must decline malformed auxiliaries and geometry,
     // while still admitting the loader's pre-attachment probe.
-    const int aux = grouped ? 3 : 2;
-    y->src[aux] = nullptr;
-    GGML_ASSERT(!ggml_backend_supports_op(backend, y));
-    y->src[aux+1] = nullptr;
-    GGML_ASSERT(ggml_backend_supports_op(backend, y));
-    y->src[aux] = svh;
-    y->src[aux+1] = suh;
-    svh->ne[0]--;
-    GGML_ASSERT(!ggml_backend_supports_op(backend, y));
-    svh->ne[0]++;
-    x->type = GGML_TYPE_F16;
-    GGML_ASSERT(!ggml_backend_supports_op(backend, y));
-    x->type = GGML_TYPE_F32;
-    w->ne[0] -= 16;
-    GGML_ASSERT(!ggml_backend_supports_op(backend, y));
-    w->ne[0] += 16;
+    if (!gpu_executor) {
+        const int aux = grouped ? 3 : 2;
+        y->src[aux] = nullptr;
+        GGML_ASSERT(!ggml_backend_supports_op(backend, y));
+        y->src[aux+1] = nullptr;
+        GGML_ASSERT(ggml_backend_supports_op(backend, y));
+        y->src[aux] = svh;
+        y->src[aux+1] = suh;
+        svh->ne[0]--;
+        GGML_ASSERT(!ggml_backend_supports_op(backend, y));
+        svh->ne[0]++;
+        x->type = GGML_TYPE_F16;
+        GGML_ASSERT(!ggml_backend_supports_op(backend, y));
+        x->type = GGML_TYPE_F32;
+        w->ne[0] -= 16;
+        GGML_ASSERT(!ggml_backend_supports_op(backend, y));
+        w->ne[0] += 16;
+    }
     auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     GGML_ASSERT(buffer);
     unsigned rng = 1234567;
@@ -165,7 +164,7 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     for (int token = 0; token < tokens; ++token) for (int slot = 0; slot < topk; ++slot) {
         const int e = grouped ? routes[token*topk+slot] - (windowed ? 1 : 0) : 0;
         if (e < 0) continue; // the reference's pre-zeroed row belongs to another rank
-        const float * in = input.data() + (token*lanes+slot%lanes)*(k+16);
+        const float * in = input.data() + (token*lanes+slot%lanes)*input_stride;
         for (int i = 0; i < k; ++i) xr[i] = in[i]*half_bits(signs[e*k+i]);
         had(xr.data(), k);
         for (auto & v : xr) v = half_round(v*norm);
@@ -181,7 +180,7 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
     bool ok = true;
     double worst = 0;
     for (int threads : {1, 4, 8, 8}) {
-        ggml_backend_cpu_set_n_threads(backend, threads);
+        if (!gpu_executor) ggml_backend_cpu_set_n_threads(backend, threads);
         GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get(y, actual.data(), 0, ggml_nbytes(y));
         if (first.empty()) first = actual;
@@ -195,7 +194,9 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
         }
         worst = std::max(worst, std::sqrt(err2/std::max(ref2, 1e-30)));
     }
-    ok &= worst < 2e-5;
+    // Standalone GPU mul1 uses quantized activations, unlike the exact CPU/cache
+    // path. Its separate batch/policy gates require exact repeated execution.
+    ok &= worst < (gpu_executor ? 1e-2 : 2e-5);
     // The cache provider accepts at most ten tokens; larger cases above still
     // exercise CPU transform sharing/fallback and exact thread-count agreement.
     if (cache_gpu && grouped && !windowed && tokens <= 10 && topk*tokens <= 64) {
@@ -267,13 +268,26 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
 }
 
 int main(int argc, char ** argv) {
+    gpu_executor = argc == 2 && std::strcmp(argv[1], "--gpu") == 0;
     if (argc == 2 && std::strcmp(argv[1], "--cache") == 0) {
         ggml_backend_load_all();
         cache_gpu = ggml_backend_init_by_name("CUDA0", nullptr);
         if (!cache_gpu) cache_gpu = ggml_backend_init_by_name("ROCm0", nullptr);
         if (!cache_gpu || !ggml_moe_cache.session_create) return 77;
     }
-    auto * backend = ggml_backend_cpu_init();
+    ggml_backend_t backend;
+    if (gpu_executor) {
+        ggml_backend_load_all();
+        backend = ggml_backend_init_by_name("CUDA0", nullptr);
+        if (!backend) backend = ggml_backend_init_by_name("ROCm0", nullptr);
+        if (!backend) return 77;
+        if (!exl3_gpu_supported(backend)) {
+            ggml_backend_free(backend);
+            return 77;
+        }
+    } else {
+        backend = ggml_backend_cpu_init();
+    }
     GGML_ASSERT(backend);
     bool ok = true;
     for (int cb = 0; cb < 3; ++cb) for (int bits = 1; bits <= 8; ++bits) {

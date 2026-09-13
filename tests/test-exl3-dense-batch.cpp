@@ -2,6 +2,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "test-exl3-gpu-common.h"
 
 #include <algorithm>
 #include <cmath>
@@ -87,6 +88,10 @@ int main() {
     if (ggml_backend_reg_dev_count(reg) == 0) return 77;
     auto * backend = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr);
     GGML_ASSERT(backend);
+    if (!exl3_gpu_supported(backend)) {
+        ggml_backend_free(backend);
+        return 77;
+    }
     bool ok = true;
     for (int bits = 1; bits <= 8; ++bits) {
         ok &= check_batch(backend, bits, 5120, 640, false);  // partial N tile, many K slices

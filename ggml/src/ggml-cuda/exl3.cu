@@ -26,8 +26,6 @@
         default: GGML_ABORT("invalid EXL3 codebook");         \
     }
 
-#if !defined(GGML_USE_HIP)
-
 #include <cstring>
 #include "exl3-dq.cuh"
 #include "exl3-had.cuh"
@@ -209,7 +207,8 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     // function attributes are per device: opt this instantiation in once on each
     static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
     if (!attr_set[ctx.device]) {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
         attr_set[ctx.device] = true;
     }
     const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
@@ -344,11 +343,13 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     exl3_had_in_kernel<<<dim3(k / 128, m), 32, 0, stream>>>(
         static_cast<const float *>(src1->data), suh, xh.get(), k);
 
-    const int compiled_cc = ggml_cuda_highest_compiled_arch(ggml_cuda_info().devices[ctx.device].cc);
-    if (m <= EXL3_GEMV_MAX_M && compiled_cc >= GGML_CUDA_CC_AMPERE) {
+#if !defined(GGML_USE_HIP)
+    if (m <= EXL3_GEMV_MAX_M && ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
         const int sms = ggml_cuda_info().devices[ctx.device].nsm;
         EXL3_DISPATCH(exl3_gemv_launch, bits, cb, xh.get(), static_cast<const uint8_t *>(src0->data), y, m, k, n, sms, stream);
-    } else {
+    } else
+#endif
+    {
         // Prefill, or pre-Ampere FP16 decode: reconstruct row chunks and use cuBLAS (F32 accumulate).
         constexpr size_t chunk_bytes = size_t(256) << 20;
         const int rows_per_chunk = int(std::max<int64_t>(128, std::min<int64_t>(n, int64_t(chunk_bytes / (size_t(k) * sizeof(half))) / 128 * 128)));
@@ -392,16 +393,6 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     EXL3_DISPATCH(exl3_moe_run, bits, cb, ctx, static_cast<const float *>(x->data), static_cast<const half *>(suh->data),
         static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh->data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
 }
-
-#else
-
-bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor *) { return false; }
-void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("EXL3 is CUDA only"); }
-bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor *) { return false; }
-void ggml_cuda_exl3_reconstruct_rows(const ggml_tensor *, int64_t, int64_t, half *, cudaStream_t) { GGML_ABORT("EXL3 is CUDA only"); }
-void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("EXL3 is CUDA only"); }
-
-#endif
 
 // The cache receives CPU-transformed activations and returns untransformed
 // dot products. It needs no NVIDIA MMA instructions; keep its accumulation

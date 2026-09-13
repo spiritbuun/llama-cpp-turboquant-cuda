@@ -30,7 +30,7 @@ constexpr int COLS    = 256;   // columns per block: 8 warps x 2 tiles
 constexpr int MAX_M   = 8;     // covers speculative verify batches (draft-max 3 default, up to 7)
 
 __device__ __forceinline__ void cp_async16(void * smem, const void * glob) {
-#if __CUDA_ARCH__ >= 800
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= 800
     const unsigned s = unsigned(__cvta_generic_to_shared(smem));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(glob));
 #else
@@ -40,13 +40,13 @@ __device__ __forceinline__ void cp_async16(void * smem, const void * glob) {
 #endif
 }
 __device__ __forceinline__ void cp_async_commit() {
-#if __CUDA_ARCH__ >= 800
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
-#if __CUDA_ARCH__ >= 800
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 #endif
 }
@@ -62,7 +62,9 @@ __device__ __forceinline__ float dot2(half2 w, half2 x) {
 }
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c) {
-#if __CUDA_ARCH__ >= 610
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+    return __builtin_amdgcn_sudot4(false, int(a), true, int(b), c, false);
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= 610
     int d;
     asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
     return d;
@@ -403,11 +405,11 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #pragma unroll
         for (int r = 0; r < M; ++r) { facc0[r] = 0.0f; facc1[r] = 0.0f; }
 
-        uint2 r0 = (active && nrows > 0) ? __ldcs(reinterpret_cast<const uint2 *>(bp)) : make_uint2(0, 0);
-        uint2 r1 = (active && nrows > 1) ? __ldcs(reinterpret_cast<const uint2 *>(bp + TWORDS)) : make_uint2(0, 0);
+        uint2 r0 = (active && nrows > 0) ? exl3::load_streaming(reinterpret_cast<const uint2 *>(bp)) : make_uint2(0, 0);
+        uint2 r1 = (active && nrows > 1) ? exl3::load_streaming(reinterpret_cast<const uint2 *>(bp + TWORDS)) : make_uint2(0, 0);
         for (int kb = 0; kb < (active ? nrows : 0); ++kb) {
             uint2 r2 = make_uint2(0, 0);
-            if (kb + 2 < nrows) r2 = __ldcs(reinterpret_cast<const uint2 *>(bp + size_t(kb + 2) * TWORDS));
+            if (kb + 2 < nrows) r2 = exl3::load_streaming(reinterpret_cast<const uint2 *>(bp + size_t(kb + 2) * TWORDS));
             const uint32_t prev = __shfl_sync(0xffffffffu, r0.y, shfl_src);
             uint32_t w0, w1, w2, w3, w4, w5, w6, w7, v0, v1, v2, v3, v4, v5, v6, v7;
             extract8_4bits(prev, r0.x, w0, w1, w2, w3, w4, w5, w6, w7);   // run t = 8*(2m)
@@ -515,11 +517,11 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         // K = 3: lanes 0..23 load word `lane` of tile A and of tile B
         auto load_row = [&](int kb, uint32_t & wa, uint32_t & wb) {
             if constexpr (bits == 2) {
-                wa = __ldcs((lane < 16 ? bpA : bpB) + size_t(kb) * TWORDS + (lane & 15));
+                wa = exl3::load_streaming((lane < 16 ? bpA : bpB) + size_t(kb) * TWORDS + (lane & 15));
                 wb = 0;
             } else if constexpr (bits == 3) {
-                wa = lane < 24 ? __ldcs(bpA + size_t(kb) * TWORDS + lane) : 0u;
-                wb = lane < 24 ? __ldcs(bpB + size_t(kb) * TWORDS + lane) : 0u;
+                wa = lane < 24 ? exl3::load_streaming(bpA + size_t(kb) * TWORDS + lane) : 0u;
+                wb = lane < 24 ? exl3::load_streaming(bpB + size_t(kb) * TWORDS + lane) : 0u;
             } else {
                 wa = 0; wb = 0;
             }
@@ -532,8 +534,8 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         }
         auto load_row2 = [&](int kb, uint2 & wa, uint2 & wb) {
             if (lane < TWORDS / 2) {
-                wa = __ldcs(reinterpret_cast<const uint2 *>(bpA + size_t(kb) * TWORDS + 2 * lane));
-                wb = __ldcs(reinterpret_cast<const uint2 *>(bpB + size_t(kb) * TWORDS + 2 * lane));
+                wa = exl3::load_streaming(reinterpret_cast<const uint2 *>(bpA + size_t(kb) * TWORDS + 2 * lane));
+                wb = exl3::load_streaming(reinterpret_cast<const uint2 *>(bpB + size_t(kb) * TWORDS + 2 * lane));
             } else {
                 wa = make_uint2(0, 0); wb = make_uint2(0, 0);
             }
@@ -575,14 +577,14 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             if (kb >= nrows) break;
             uint32_t wA[8], wB[8];
             if constexpr (REG) {
-                const uint32_t ca = pa[d], cb = pb[d];
+                const uint32_t ca = pa[d], word_b = pb[d];
                 if (kb + RING < nrows) load_row(kb + RING, pa[d], pb[d]);
                 if constexpr (bits == 2) {
                     regs2_windows(__shfl_sync(0xffffffffu, ca, x_src_a), __shfl_sync(0xffffffffu, ca, x_src_b), t0, wA);
                     regs2_windows(__shfl_sync(0xffffffffu, ca, 16 + x_src_a), __shfl_sync(0xffffffffu, ca, 16 + x_src_b), t0, wB);
                 } else {
                     regs3_windows(__shfl_sync(0xffffffffu, ca, x_src_a), __shfl_sync(0xffffffffu, ca, x_src_b), x_s2, wA);
-                    regs3_windows(__shfl_sync(0xffffffffu, cb, x_src_a), __shfl_sync(0xffffffffu, cb, x_src_b), x_s2, wB);
+                    regs3_windows(__shfl_sync(0xffffffffu, word_b, x_src_a), __shfl_sync(0xffffffffu, word_b, x_src_b), x_s2, wB);
                 }
             } else if constexpr (STAGE) {
                 cp_async_wait<STAGE_D - 2>();
@@ -592,11 +594,11 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 ext8w<bits>(rowp, t0, wA[0], wA[1], wA[2], wA[3], wA[4], wA[5], wA[6], wA[7]);
                 ext8w<bits>(rowp + TWORDS, t0, wB[0], wB[1], wB[2], wB[3], wB[4], wB[5], wB[6], wB[7]);
             } else if constexpr (REGW) {
-                const uint2 ca = qa0, cb = qb0;
+                const uint2 ca = qa0, word_b = qb0;
                 qa0 = qa1; qb0 = qb1;
                 if (kb + 2 < nrows) load_row2(kb + 2, qa1, qb1);
                 regsw_windows<bits>(ca, t0, wA);
-                regsw_windows<bits>(cb, t0, wB);
+                regsw_windows<bits>(word_b, t0, wB);
             } else {
                 ext8w<bits>(bpA + size_t(kb) * TWORDS, t0, wA[0], wA[1], wA[2], wA[3], wA[4], wA[5], wA[6], wA[7]);
                 ext8w<bits>(bpB + size_t(kb) * TWORDS, t0, wB[0], wB[1], wB[2], wB[3], wB[4], wB[5], wB[6], wB[7]);
@@ -687,7 +689,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         float v = 0.0f;
         if (col < n) {
             for (int sl = 0; sl < int(gridDim.y); ++sl) {
+#if defined(GGML_USE_HIP)
+                // Read other blocks' published partials through an agent-scope load.
+                v += __hip_atomic_load(partials + (size_t(sl) * M + r) * n + col,
+                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
                 v += __ldcg(partials + (size_t(sl) * M + r) * n + col);
+#endif
             }
         }
         sh_y[r][threadIdx.x] = v;

@@ -3,7 +3,11 @@
 // EXL3 Hadamard helpers: 128-element Sylvester transform, one warp = 128 values (4 per lane).
 // Mirrors exllamav3's had_hf_r_128_inner ordering.
 
+#if defined(GGML_USE_HIP)
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 #include <cstdint>
 
 namespace exl3_had {

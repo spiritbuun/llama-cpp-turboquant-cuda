@@ -7,7 +7,6 @@
 //   VEC4 = true : [kt/4][lane 0..31][4 words]  (bits == 4)   (one uint4 per lane = 4 k slices)
 
 #include "exl3-dq.cuh"
-#include <cuda_fp16.h>
 
 namespace exl3_gemv {
 
@@ -19,7 +18,7 @@ using exl3::FragC_h;
 // ---- decode gemv (m <= 8): warps split k, one m16n8k16 MMA pair per tile ------------------
 
 __device__ __forceinline__ void exl3_mma_ab_h(const FragB & a01, const FragB & a23, const FragB & b, FragC_h & c) {
-#if __CUDA_ARCH__ >= 800
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= 800
     const uint32_t * a0 = reinterpret_cast<const uint32_t *>(&a01);
     const uint32_t * a1 = reinterpret_cast<const uint32_t *>(&a23);
     const uint32_t * bb = reinterpret_cast<const uint32_t *>(&b);
@@ -171,11 +170,11 @@ __global__ void __launch_bounds__(WK * 32) exl3_gemv_kernel(const half * __restr
         auto ld_b = [&](int i, int l) -> uint32_t {
             const int kt = ks0 + i;
             if constexpr (bits == 2) {
-                return __ldcs(tile_ptr(2 * l + (lane >> 4), kt) + (lane & 15));
+                return exl3::load_streaming(tile_ptr(2 * l + (lane >> 4), kt) + (lane & 15));
             } else if constexpr (bits == 3) {
-                return lane < 24 ? __ldcs(tile_ptr(l, kt) + lane) : 0u;
+                return lane < 24 ? exl3::load_streaming(tile_ptr(l, kt) + lane) : 0u;
             } else {
-                return __ldcs(tile_ptr(l, kt) + lane);
+                return exl3::load_streaming(tile_ptr(l, kt) + lane);
             }
         };
 
@@ -183,7 +182,7 @@ __global__ void __launch_bounds__(WK * 32) exl3_gemv_kernel(const half * __restr
         const uint4 * bg4 = reinterpret_cast<const uint4 *>(bg);
         const int kquads = kslices / 4;
         auto ld_b4 = [&](int q, int t) -> uint4 {
-            return __ldcs(bg4 + (size_t(t) * kquads + q) * 32 + lane);
+            return exl3::load_streaming(bg4 + (size_t(t) * kquads + q) * 32 + lane);
         };
         const int q0 = ks0 / 4;
         const int myq = (myn + 3) / 4;
@@ -267,7 +266,7 @@ __global__ void __launch_bounds__(WK * 32) exl3_gemv_kernel(const half * __restr
                     for (int t = 0; t < WNT; ++t) {
                         const uint32_t * tp = tile_ptr(t, kt);
                         for (int w = lane; w < TWORDS; w += 32) {
-                            sh_stage[warp][t * TWORDS + w] = __ldcs(tp + w);
+                            sh_stage[warp][t * TWORDS + w] = exl3::load_streaming(tp + w);
                         }
                     }
                     __syncwarp();

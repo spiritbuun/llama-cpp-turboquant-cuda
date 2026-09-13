@@ -5,15 +5,30 @@
 #ifndef EXL3_STANDALONE
 #include "common.cuh"
 #endif
+#if defined(GGML_USE_HIP)
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 #include <cstdint>
 
 namespace exl3 {
 
+template<typename T>
+__device__ __forceinline__ T load_streaming(const T * ptr) {
+#if defined(GGML_USE_HIP)
+    return *ptr;
+#else
+    return __ldcs(ptr);
+#endif
+}
+
 // Codebook products contain unsigned bytes. The signed ggml_cuda_dp4a
 // fallback would change values with the high bit set on pre-SM61 devices.
 __device__ __forceinline__ uint32_t byte_sum(uint32_t x, uint32_t acc) {
-#if __CUDA_ARCH__ >= 610
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+    return uint32_t(__builtin_amdgcn_sudot4(false, int(x), false, 0x01010101, int(acc), false));
+#elif !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= 610
     return __dp4a(x, 0x01010101u, acc);
 #else
     return acc + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
@@ -43,8 +58,22 @@ union half_uint16 {
     __device__ half_uint16(half val) : as_half(val) {}
     __device__ half_uint16() : as_uint16(0) {}
 };
+#if defined(GGML_USE_HIP)
+#define EXL3_FSHF_IMM(dst, lo, hi, imm) (dst = uint32_t(((uint64_t(hi) << 32) | uint32_t(lo)) >> ((imm) & 31)))
+#define EXL3_BFE16_IMM(dst, src, imm) (dst = (uint32_t(src) >> (imm)) & 65535u)
+#else
 #define EXL3_FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
 #define EXL3_BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+#endif
+
+__device__ __forceinline__ uint32_t codebook_mask(uint32_t x) {
+#if defined(GGML_USE_HIP)
+    return (x & 0x8fff8fffu) ^ 0x3b603b60u;
+#else
+    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+    return x;
+#endif
+}
 
 
 
@@ -73,8 +102,8 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
 // Ditto mcg (cb 1)
 __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
 {
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+    x0 = codebook_mask(x0);
+    x1 = codebook_mask(x1);
     half2_uint32 xu0(x0);
     half2_uint32 xu1(x1);
     half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -89,7 +118,7 @@ __device__ inline half decode_3inst(uint32_t x)
     {
         x *= 89226354u;
         x += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x = codebook_mask(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -98,7 +127,7 @@ __device__ inline half decode_3inst(uint32_t x)
         x *= 0xCBAC1FEDu;
         // x = mul_const_u32<0xCBAC1FEDu>(x);
 
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x = codebook_mask(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -127,8 +156,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         x1 *= 89226354u;
         x0 += 64248484u;
         x1 += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+        x0 = codebook_mask(x0);
+        x1 = codebook_mask(x1);
         half2_uint32 xu0(x0);
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);

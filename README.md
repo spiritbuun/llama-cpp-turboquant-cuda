@@ -217,10 +217,11 @@ then evicts the minimum expert footprint needed to form cache pools.
 
 ### EXL3 and CPU overlap
 
-EXL3 supports CPU expert execution and CUDA/HIP MoE caching. HIP currently uses CPU
-execution for standalone EXL3 matrix operations; only cached expert dot products
-run on the GPU. Eligible mmap-backed CPU weights can be paged from SSD; active
-pages still use host RAM, and heavy paging can be much slower than RAM residency.
+EXL3 supports CPU expert execution and CUDA/HIP MoE caching. HIP also supports
+standalone EXL3 matrix operations on wave32 GPUs (tested on RDNA4); wave64 GPUs
+retain CPU execution and the GPU expert-cache path. Eligible mmap-backed CPU weights
+can be paged from SSD; active pages still use host RAM, and heavy paging can be much
+slower than RAM residency.
 By default, cached EXL3 work stays on
 GPU rather than assigning a share to CPU: CPU trellis decoding can otherwise hold up the GPU's
 completed work. Experts missing from the GPU cache still run on CPU.

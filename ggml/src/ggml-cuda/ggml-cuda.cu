@@ -797,8 +797,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_fattn_scratch_free(*this);
     ggml_cuda_vbr_transcode_workspace_free(*this);
 
-#if !defined(GGML_USE_HIP)
     ggml_cuda_set_device(device);
+    for (int * ptr : exl3_int8_counter_storage) {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+        }
+    }
+#if !defined(GGML_USE_HIP)
     for (auto & item : humming_fp8_cache) {
         CUDA_CHECK(cudaFree(item.second.scale));
     }
@@ -809,9 +814,6 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     }
     for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
-        if (exl3_int8_counter_storage[i] != nullptr) {
-            CUDA_CHECK(cudaFree(exl3_int8_counter_storage[i]));
-        }
         auto & storage = humming_fp8_locks[i];
         if (storage.ptr != nullptr) {
             CUDA_CHECK(cudaFree(storage.ptr));
@@ -8676,17 +8678,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 struct ggml_tensor * b = op->src[1];
                 if (ggml_cuda_is_exl3(a->type)) {
 #if defined(GGML_USE_HIP)
-                    // HIP supports EXL3 through the CPU expert-cache bridge,
-                    // not the standalone CUDA dense/routed executors.
-                    return false;
-#else
+                    // The shared EXL3 executor uses 32-lane transforms. Wave64
+                    // devices retain the independent CPU expert-cache bridge.
+                    if (ggml_cuda_info().devices[dev_ctx->device].warp_size != 32) {
+                        return false;
+                    }
+#endif
                     if (op->op == GGML_OP_MUL_MAT_ID) {
                         // per-expert dispatch through the EXL3 mul_mat; scales are src[3]/src[4]
                         return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                             a->ne[0] % 128 == 0 && a->ne[1] % 128 == 0;
                     }
                     return op->op == GGML_OP_MUL_MAT && ggml_cuda_exl3_supports_mul_mat(op);
-#endif
                 }
                 if (op->op == GGML_OP_MUL_MAT && op->src[3] != nullptr) {
 #if defined(GGML_USE_HIP)
